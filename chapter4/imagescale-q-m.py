@@ -9,29 +9,23 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 # General Public License for more details.
 
-
-import sys
-if sys.version_info < (3, 2):
-    print("requires Python 3.2+ for concurrent.futures")
-    sys.exit(1)
-
 import argparse
 import collections
-import concurrent.futures
 import math
 import multiprocessing
 import os
+import sys
 import Image
 import Qtrac
 
 
-Result = collections.namedtuple("Result", "copied scaled name")
-Summary = collections.namedtuple("Summary", "todo copied scaled canceled")
+Result = collections.namedtuple("Result", "copied scaled name")  # name 缩小后的名字  单个图片的处理结果
+Summary = collections.namedtuple("Summary", "todo copied scaled canceled")  # 所有图片处理结果的汇总
 
 
 def main():
-    # 使用线程池
-    size, smooth, source, target, concurrency = handle_commandline()
+    # 使用进程队列
+    size, smooth, source, target, concurrency = handle_commandline()  # 读取命令行参数
     Qtrac.report("starting...")
     summary = scale(size, smooth, source, target, concurrency)
     summarize(summary, concurrency)
@@ -44,10 +38,10 @@ def handle_commandline():
             help="specify the concurrency (for debugging and "
                 "timing) [default: %(default)d]")
     parser.add_argument("-s", "--size", default=400, type=int,
-            help="缩小后的图像尺寸 "
+            help="make a scaled image that fits the given dimension "
                 "[default: %(default)d]")
     parser.add_argument("-S", "--smooth", action="store_true",
-            help="是否使用平滑缩放(slow but good for text)")
+            help="use smooth scaling (slow but good for text)")
     parser.add_argument("source",
             help="the directory containing the original .xpm images")
     parser.add_argument("target",
@@ -63,47 +57,54 @@ def handle_commandline():
 
 
 def scale(size, smooth, source, target, concurrency):
-    futures = set()
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=concurrency) as executor:
-        for sourceImage, targetImage in get_jobs(source, target):
-            futures.add(executor.submit(scale_one, size, smooth,
-                    sourceImage, targetImage))
-        summary = wait_for(futures)
-        if summary.canceled:
-            executor.shutdown()
-        return summary
-# if we caught the KeyboardInterrupt in this function we'd lose the
-# accumulated todo, copied, scaled counts.
-
-
-def get_jobs(source, target):
-    for name in os.listdir(source):
-        yield os.path.join(source, name), os.path.join(target, name)
-
-
-def wait_for(futures):
     canceled = False
-    copied = scaled = 0
+    jobs = multiprocessing.JoinableQueue()  # 任务队列
+    results = multiprocessing.Queue()       # 结果队列
+    create_processes(size, smooth, jobs, results, concurrency)   # 创建进程，阻塞，直到任务队列中放入任务
+    todo = add_jobs(source, target, jobs)  # 将任务队列中放入任务
     try:
-        for future in concurrent.futures.as_completed(futures):
-            err = future.exception()
-            if err is None:
-                result = future.result()
-                copied += result.copied
-                scaled += result.scaled
-                Qtrac.report("{} {}".format("copied" if result.copied else
-                        "scaled", os.path.basename(result.name)))
-            elif isinstance(err, Image.Error):
-                Qtrac.report(str(err), True)
-            else:
-                raise err # Unanticipated
-    except KeyboardInterrupt:
+        jobs.join()  # 生产者调用此方法进行阻塞，直到队列中所有的项目均被处理，阻塞将持续到队列中的每个项目调用task_done方法为止
+    except KeyboardInterrupt: # May not work on Windows
         Qtrac.report("canceling...")
         canceled = True
-        for future in futures:
-            future.cancel()
-    return Summary(len(futures), copied, scaled, canceled)
+    copied = scaled = 0
+    while not results.empty(): # Safe because all jobs have finished
+        result = results.get_nowait()
+        copied += result.copied
+        scaled += result.scaled
+    return Summary(todo, copied, scaled, canceled)
+
+
+def create_processes(size, smooth, jobs, results, concurrency):
+    for _ in range(concurrency):
+        process = multiprocessing.Process(target=worker, args=(size, smooth, 
+                                          jobs, results))
+        process.daemon = True
+        process.start()
+
+
+def worker(size, smooth, jobs, results):
+    while True:
+        try:
+            sourceImage, targetImage = jobs.get()
+            try:
+                result = scale_one(size, smooth, sourceImage, targetImage)
+                Qtrac.report("{} {}".format("copied" if result.copied else
+                        "scaled", os.path.basename(result.name)))
+                results.put(result)
+            except Image.Error as err:
+                Qtrac.report(str(err), True)
+        finally:
+            jobs.task_done()  # 使用者使用此方法发出信号，表示get的返回项目已经被处理。必须与get方法一一对应，如果调用此方法的次数大于从
+                                # 队列中删除项目的数量，将因为ValueError异常，通知进程是使用共享的信号和条件变量来实现的。
+
+
+def add_jobs(source, target, jobs):
+    for todo, name in enumerate(os.listdir(source), start=1):
+        sourceImage = os.path.join(source, name)
+        targetImage = os.path.join(target, name)
+        jobs.put((sourceImage, targetImage))
+    return todo
 
 
 def scale_one(size, smooth, sourceImage, targetImage):
@@ -120,15 +121,21 @@ def scale_one(size, smooth, sourceImage, targetImage):
                                        oldImage.height / size)))
             newImage = oldImage.subsample(stride)
         newImage.save(targetImage)
-        return Result(0, 1, targetImage)
+        return Result(0, 1, targetImage) # 将单个结果存到具名元组中
 
 
 def summarize(summary, concurrency):
+    """汇总所有的处理结果
+    
+    Arguments:
+        summary {[type]} -- [description]
+        concurrency {[type]} -- [description]
+    """
     message = "copied {} scaled {} ".format(summary.copied, summary.scaled)
     difference = summary.todo - (summary.copied + summary.scaled)
     if difference:
         message += "skipped {} ".format(difference)
-    message += "using {} threads".format(concurrency)
+    message += "using {} processes".format(concurrency)
     if summary.canceled:
         message += " [canceled]"
     Qtrac.report(message)

@@ -9,32 +9,30 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 # General Public License for more details.
 
-
-import sys
-if sys.version_info < (3, 2):
-    print("requires Python 3.2+ for concurrent.futures")
-    sys.exit(1)
-
 import argparse
 import collections
-import concurrent.futures
 import math
 import multiprocessing
 import os
+import sys
 import Image
 import Qtrac
 
 
-Result = collections.namedtuple("Result", "copied scaled name")
-Summary = collections.namedtuple("Summary", "todo copied scaled canceled")
+Result = collections.namedtuple("Result", "todo copied scaled name")
 
 
 def main():
-    # 使用线程池
+    # 使用协程
     size, smooth, source, target, concurrency = handle_commandline()
     Qtrac.report("starting...")
-    summary = scale(size, smooth, source, target, concurrency)
-    summarize(summary, concurrency)
+    canceled = False
+    try:
+        scale(size, smooth, source, target, concurrency)
+    except KeyboardInterrupt:
+        Qtrac.report("canceling...")
+        canceled = True
+    summarize(concurrency, canceled)
 
 
 def handle_commandline():
@@ -44,10 +42,10 @@ def handle_commandline():
             help="specify the concurrency (for debugging and "
                 "timing) [default: %(default)d]")
     parser.add_argument("-s", "--size", default=400, type=int,
-            help="缩小后的图像尺寸 "
+            help="make a scaled image that fits the given dimension "
                 "[default: %(default)d]")
     parser.add_argument("-S", "--smooth", action="store_true",
-            help="是否使用平滑缩放(slow but good for text)")
+            help="use smooth scaling (slow but good for text)")
     parser.add_argument("source",
             help="the directory containing the original .xpm images")
     parser.add_argument("target",
@@ -63,18 +61,18 @@ def handle_commandline():
 
 
 def scale(size, smooth, source, target, concurrency):
-    futures = set()
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=concurrency) as executor:
-        for sourceImage, targetImage in get_jobs(source, target):
-            futures.add(executor.submit(scale_one, size, smooth,
-                    sourceImage, targetImage))
-        summary = wait_for(futures)
-        if summary.canceled:
-            executor.shutdown()
-        return summary
-# if we caught the KeyboardInterrupt in this function we'd lose the
-# accumulated todo, copied, scaled counts.
+    pipeline = create_pipeline(size, smooth, concurrency)
+    for i, (sourceImage, targetImage) in enumerate(
+            get_jobs(source, target)):
+        pipeline.send((sourceImage, targetImage, i % concurrency))
+
+
+def create_pipeline(size, smooth, concurrency):
+    pipeline = None
+    sink = results()
+    for who in range(concurrency):
+        pipeline = scaler(pipeline, sink, size, smooth, who)
+    return pipeline
 
 
 def get_jobs(source, target):
@@ -82,35 +80,37 @@ def get_jobs(source, target):
         yield os.path.join(source, name), os.path.join(target, name)
 
 
-def wait_for(futures):
-    canceled = False
-    copied = scaled = 0
-    try:
-        for future in concurrent.futures.as_completed(futures):
-            err = future.exception()
-            if err is None:
-                result = future.result()
-                copied += result.copied
-                scaled += result.scaled
-                Qtrac.report("{} {}".format("copied" if result.copied else
-                        "scaled", os.path.basename(result.name)))
-            elif isinstance(err, Image.Error):
+@Qtrac.coroutine
+def scaler(receiver, sink, size, smooth, me):
+    while True:
+        sourceImage, targetImage, who = (yield)
+        if who == me:
+            try:
+                result = scale_one(size, smooth, sourceImage, targetImage)
+                sink.send(result)
+            except Image.Error as err:
                 Qtrac.report(str(err), True)
-            else:
-                raise err # Unanticipated
-    except KeyboardInterrupt:
-        Qtrac.report("canceling...")
-        canceled = True
-        for future in futures:
-            future.cancel()
-    return Summary(len(futures), copied, scaled, canceled)
+        elif receiver is not None:
+            receiver.send((sourceImage, targetImage, who))
+
+
+@Qtrac.coroutine
+def results():
+    while True:
+        result = (yield)
+        results.todo += result.todo
+        results.copied += result.copied
+        results.scaled += result.scaled
+        Qtrac.report("{} {}".format("copied" if result.copied else "scaled",
+                os.path.basename(result.name)))
+results.todo = results.copied = results.scaled = 0
 
 
 def scale_one(size, smooth, sourceImage, targetImage):
     oldImage = Image.from_file(sourceImage)
     if oldImage.width <= size and oldImage.height <= size:
         oldImage.save(targetImage)
-        return Result(1, 0, targetImage)
+        return Result(1, 1, 0, targetImage)
     else:
         if smooth:
             scale = min(size / oldImage.width, size / oldImage.height)
@@ -120,16 +120,16 @@ def scale_one(size, smooth, sourceImage, targetImage):
                                        oldImage.height / size)))
             newImage = oldImage.subsample(stride)
         newImage.save(targetImage)
-        return Result(0, 1, targetImage)
+        return Result(1, 0, 1, targetImage)
 
 
-def summarize(summary, concurrency):
-    message = "copied {} scaled {} ".format(summary.copied, summary.scaled)
-    difference = summary.todo - (summary.copied + summary.scaled)
+def summarize(concurrency, canceled):
+    message = "copied {} scaled {} ".format(results.copied, results.scaled)
+    difference = results.todo - (results.copied + results.scaled)
     if difference:
         message += "skipped {} ".format(difference)
-    message += "using {} threads".format(concurrency)
-    if summary.canceled:
+    message += "using {} coroutines".format(concurrency)
+    if canceled:
         message += " [canceled]"
     Qtrac.report(message)
     print()

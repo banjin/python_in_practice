@@ -9,12 +9,10 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 # General Public License for more details.
 
-
 import sys
 if sys.version_info < (3, 2):
     print("requires Python 3.2+ for concurrent.futures")
     sys.exit(1)
-
 import argparse
 import collections
 import concurrent.futures
@@ -25,12 +23,12 @@ import Image
 import Qtrac
 
 
-Result = collections.namedtuple("Result", "copied scaled name")
-Summary = collections.namedtuple("Summary", "todo copied scaled canceled")
+Result = collections.namedtuple("Result", "copied scaled name")  # 单个图形的结果
+Summary = collections.namedtuple("Summary", "todo copied scaled canceled")   # 所有图形的结果汇总
 
 
 def main():
-    # 使用线程池
+    # 使用进程池
     size, smooth, source, target, concurrency = handle_commandline()
     Qtrac.report("starting...")
     summary = scale(size, smooth, source, target, concurrency)
@@ -44,10 +42,10 @@ def handle_commandline():
             help="specify the concurrency (for debugging and "
                 "timing) [default: %(default)d]")
     parser.add_argument("-s", "--size", default=400, type=int,
-            help="缩小后的图像尺寸 "
+            help="make a scaled image that fits the given dimension "
                 "[default: %(default)d]")
     parser.add_argument("-S", "--smooth", action="store_true",
-            help="是否使用平滑缩放(slow but good for text)")
+            help="use smooth scaling (slow but good for text)")
     parser.add_argument("source",
             help="the directory containing the original .xpm images")
     parser.add_argument("target",
@@ -64,11 +62,12 @@ def handle_commandline():
 
 def scale(size, smooth, source, target, concurrency):
     futures = set()
-    with concurrent.futures.ThreadPoolExecutor(
+    with concurrent.futures.ProcessPoolExecutor(
             max_workers=concurrency) as executor:
         for sourceImage, targetImage in get_jobs(source, target):
-            futures.add(executor.submit(scale_one, size, smooth,
-                    sourceImage, targetImage))
+            future = executor.submit(scale_one, size, smooth, sourceImage,
+                                     targetImage)
+            futures.add(future)
         summary = wait_for(futures)
         if summary.canceled:
             executor.shutdown()
@@ -107,6 +106,17 @@ def wait_for(futures):
 
 
 def scale_one(size, smooth, sourceImage, targetImage):
+    """缩小单个图片
+    
+    Arguments:
+        size {[type]} -- [description]
+        smooth {[type]} -- [description]
+        sourceImage {[type]} -- [description]
+        targetImage {[type]} -- [description]
+    
+    Returns:
+        [type] -- [description]
+    """
     oldImage = Image.from_file(sourceImage)
     if oldImage.width <= size and oldImage.height <= size:
         oldImage.save(targetImage)
@@ -128,7 +138,7 @@ def summarize(summary, concurrency):
     difference = summary.todo - (summary.copied + summary.scaled)
     if difference:
         message += "skipped {} ".format(difference)
-    message += "using {} threads".format(concurrency)
+    message += "using {} processes".format(concurrency)
     if summary.canceled:
         message += " [canceled]"
     Qtrac.report(message)
@@ -137,3 +147,4 @@ def summarize(summary, concurrency):
 
 if __name__ == "__main__":
     main()
+    import bisect
