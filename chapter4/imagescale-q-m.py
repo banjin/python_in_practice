@@ -79,7 +79,7 @@ def create_processes(size, smooth, jobs, results, concurrency):
     for _ in range(concurrency):
         process = multiprocessing.Process(target=worker, args=(size, smooth, 
                                           jobs, results))
-        process.daemon = True
+        process.daemon = True   # 主进程终止后所有子进程也会终止
         process.start()
 
 
